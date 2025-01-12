@@ -1,0 +1,286 @@
+import argparse
+import itertools
+import math
+from collections import defaultdict
+import sys
+
+class CommandLine:
+    '''
+    Handle the command line, usage and help requests.
+
+    CommandLine uses argparse, now standard in 2.7 and beyond.
+    It implements a standard command line argument parser with various argument options,
+    a standard usage and help, and an error termination mechanism do-usage_and_die.
+
+    attributes:
+    all arguments received from the commandline using .add_argument will be
+    available within the .args attribute of object instantiated from CommandLine.
+    For example, if myCommandLine is an object of the class, and required_bool was
+    set as an option using add_argument, then myCommandLine.args.required_bool will
+    name that option.
+
+    '''
+    def __init__(self, in_opts=None):
+        '''
+        Constructor for CommandLine.
+
+        Args:
+            in_opts (list): Optional. List of command-line options and arguments.
+        '''
+        self.parser = argparse.ArgumentParser(
+            description='Analyze k-mers in genome sequences',
+            epilog='Program by YourName',
+            add_help=True,
+            prefix_chars='-',
+            usage='%(prog)s [options] -l [default] -m [default] -c [default]'
+        )
+
+        self.parser.add_argument('-l', '--minMotif', nargs='?', default=3, action='store',
+                                 help='minimum k-mer size')
+        self.parser.add_argument('-m', '--maxMotif', nargs='?', default=8, action='store',
+                                 help='maximum k-mer size')
+        self.parser.add_argument('-c', '--cutoff', nargs='?', type=float, default=0.01, action='store',
+                                 help='Z-score cutoff')
+        self.parser.add_argument('-v', '--version', action='version', version='%(prog)s 1.0')
+
+        if in_opts is None:
+            self.args = self.parser.parse_args()
+        else:
+            self.args = self.parser.parse_args(in_opts)
+
+class FastAReader:
+    '''
+    Read FastA sequences from a file or standard input.
+    '''
+    def __init__(self, fname=''):
+        '''
+        Constructor for FastAReader.
+
+        Args:
+            fname (str): Optional. The name of the input FastA file.
+        '''
+        self.fname = fname
+        self.fileH = None
+        #        self.minK = minK
+        # self.maxK = maxK
+        # self.motif_counts = defaultdict(int)
+
+    def open_file(self):
+        '''
+        Open the input file or standard input.
+
+        Returns:
+            file: The file handle for reading.
+        '''
+        if self.fname is None:
+            return sys.stdin
+        else:
+            return open(self.fname)
+
+    def read_fasta(self):
+        '''
+        Read FastA sequences from the file.
+
+        Yields:
+            tuple: A tuple containing header and sequence for each sequence in the file.
+        '''
+        header = ''
+        sequence = ''
+
+        with self.open_file() as self.fileH:
+            header = ''
+            sequence = ''
+
+            line = self.fileH.readline()
+            while not line.startswith('>'):
+                line = self.fileH.readline()
+            header = line[1:].rstrip()
+
+            for line in self.fileH:
+                if line.startswith('>'):
+                    yield header, sequence
+                    header = line[1:].rstrip()
+                    sequence = ''
+                else:
+                    sequence += ''.join(line.rstrip().split()).upper()
+
+        yield header, sequence
+
+class Genome:
+    '''
+    Given the sequence of a genome, count all k-mers of specified lengths. Construct a Markov(k-2) null model
+    to find the expected number of k-mer sequences. Calculate a Z-Score to compare the count of a k-mer to the
+    expected number of that k-mer.
+    '''
+    def __init__(self, minK=3, maxK=8):
+        '''
+        Initialize the object for counting and analyzing k-mer frequencies.
+
+        Parameters:
+        - minK (int): Minimum k-mer size (default is 3).
+        - maxK (int): Maximum k-mer size (default is 8).
+        '''
+        #  minK and maxK are integers
+        self.min = int(minK)
+        self.max = int(maxK)
+
+        # Adjust minK to ensure it's at least 1
+        if self.min - 2 < 1:
+            self.adjMin = 1
+        else:
+            self.adjMin = self.min - 2
+
+        # Dictionary to store k-mer counts from the genome
+        self.kCounts = {}
+
+        # Contains all possible k-mers from minK to maxK
+        self.posKmers = {}
+
+        # init  k-mers with f value for reverse complement sequence pairing in the main
+        for k in range(self.min, self.max + 1):
+            kList = list(itertools.product('ATCG', repeat=k))
+            for sequence in kList:
+                self.posKmers[''.join(sequence)] = False
+
+        # Number of molecules (chromosomes/plasmids)
+        self.molecules = 0
+
+        # Size of the genome
+        self.n = 0
+
+    def calculate_expected_kmer_count(self, sequence):
+        '''
+        Return the expected k-mer count for a sequence using a Markov(k-2) model.
+        '''
+        try:
+             # Construct r k-mer
+            r_kmer_count = self.kCounts[sequence[1:]]
+            # Construct c k-mer
+            c_kmer_count = self.kCounts[sequence[1:len(sequence) - 1]]
+            # Construct l k-mer
+            l_kmer_count = self.kCounts[sequence[:len(sequence) - 1]]
+        except KeyError:
+            # Set count = 0 if k-mer does not exist in the genome
+            r_kmer_count = 0
+            c_kmer_count = 0
+            l_kmer_count = 0
+
+        try:
+            # Calculate the expected value
+            return (r_kmer_count * l_kmer_count) / c_kmer_count
+        except ZeroDivisionError:
+            # case where c_kmer_count = 0 
+            return 0
+
+    def reverse_complement(self, sequence):
+        '''
+        Calculate the reverse complement of a DNA sequence.
+
+        Args:
+            sequence (str): The DNA sequence.
+
+        Returns:
+            str: The reverse complement sequence.
+        '''
+        complement = sequence.replace('A','t').replace('T','a').replace('G','c').replace('C','g').upper()
+        return complement[::-1]
+
+    def add_sequence(self, sequence):
+        '''Count all k-mers in a given sequence from MinMotif-2 to MaxMotif.'''
+        self.n += len(sequence)
+        self.molecules += 1
+
+        for nucleotide_position in range(len(sequence)):
+            # Loop through  specified k-mer size
+            for k in range(self.adjMin, self.max + 1):
+                kMer = sequence[nucleotide_position : nucleotide_position + k]
+                reverse_complement = self.reverse_complement(kMer)
+
+                # Remove k-mers shorter than k from the end of the sequence.
+                if len(kMer) != k:
+                    continue
+                else:
+                    # Advance k-mer count each time one is found, or add to dictionary.
+                    if kMer in self.kCounts:
+                        self.kCounts[kMer] += 1
+                    else:
+                        self.kCounts[kMer] = 1
+
+                    # Advance k-mer count for reverse complement as well
+                    # Reverse Complements can be treated as the same sequence
+                    if reverse_complement in self.kCounts and reverse_complement != kMer:
+                        self.kCounts[reverse_complement] += 1
+                    elif reverse_complement not in self.kCounts and reverse_complement != kMer:
+                        # If sequence is a palindrome, do not count it twice
+                        self.kCounts[reverse_complement] = 1
+
+    def zScore(self, sequence):
+        '''Return a Z-score for a k-mer comparing the actual count to the expected count.'''
+        # Calculate expected count for a sequence
+        mu = self.calculate_expected_kmer_count(sequence)
+        # Calculate standard Deviation for a sequence
+        sd = math.sqrt(mu*(1-(mu/self.n)))
+        try:
+            # Calculate Z-score
+            return (self.kCounts[sequence] - mu) / sd
+        except KeyError:
+            return - mu / sd
+
+def main(in_file=None, options=None):
+    '''
+    Args:
+        in_file (str): Optional. Input FastA file.
+        options (list): Optional. List of command-line options and arguments.
+    '''
+    s_reader = FastAReader(in_file)
+    cl = CommandLine(options)
+
+    # Set up a Genome object
+    genome = Genome(cl.args.minMotif, cl.args.maxMotif)
+
+    # Add all chromosome/plasmids to Genome object to count k-mers
+    for head, sequence in s_reader.read_fasta():
+        genome.add_sequence(sequence)
+
+    
+    print(f'N = {genome.n}  molecules = {genome.molecules}')
+
+    # Construct a main list to input data for sorting later
+    main_data = []
+
+    # Iterate through all possible k-mers
+    for k_mer, printed in genome.posKmers.items():
+        if printed == False:
+            rc = genome.reverse_complement(k_mer)
+            genome.posKmers[k_mer] = True
+            genome.posKmers[rc] = True
+            try:
+                count = genome.kCounts[k_mer]
+            except KeyError:
+                count = 0
+
+            #  expected value of k-mer
+            expect = genome.calculate_expected_kmer_count(k_mer)
+
+            #  zScore of k-mer
+            z_score = genome.zScore(k_mer)
+
+            # Sort alpa
+            sequences = sorted([k_mer, rc])
+
+            #significant k-mers
+            if z_score <= cl.args.cutoff:
+                main_data.append([sequences[0], sequences[1], count, expect, z_score])
+
+    # Sort data: k-mer length + zScore value
+    main_data.sort(key=lambda x: (-len(x[0]), x[4]))
+    for data in main_data:
+        print('{0:8}:{1:8}\t{2:0d}\t{3:0.2f}\t{4:0.2f}'.format(data[0], data[1], data[2], data[3], data[4]))
+
+    # Write data --> output file
+    with open("output.txt", 'w') as output_file:
+        for data in main_data:
+            output_file.write(f'{data[0]}:{data[1]} {data[2]} {data[3]:.2f} {data[4]:.2f}\n')
+
+if __name__ == "__main__":
+    main(in_file="Ecoli-UMN026.fa", options=["--minMotif=3", "--maxMotif=8", "--cutoff=-4."])

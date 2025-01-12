@@ -1,0 +1,207 @@
+import sys
+import argparse
+from collections import defaultdict
+import numpy as np
+
+class FastAreader:
+    '''
+    Read FastA sequences from a file or standard input.
+    '''
+
+    def __init__(self, fname=''):
+        '''
+        Constructor for FastAreader.
+
+        Args:
+            fname (str): Optional. The name of the input FastA file.
+        '''
+        self.fname = fname
+        self.fileH = None
+
+    def doOpen(self):
+        '''
+        Open the input file or standard input.
+
+        Returns:
+            file: The file handle for reading.
+        '''
+        if self.fname == '':
+            return sys.stdin
+        else:
+            return open(self.fname)
+
+    def readFasta(self):
+        '''
+        Read FastA sequences from the file.
+
+        Yields:
+            tuple: A tuple containing header and sequence for each sequence in the file.
+        '''
+        header = ''
+        sequence = ''
+        with self.doOpen() as self.fileH:
+            header = ''
+            sequence = ''
+            line = self.fileH.readline()
+            while not line.startswith('>'):
+                line = self.fileH.readline()
+            header = line[1:].rstrip()
+            for line in self.fileH:
+                if line.startswith('>'):
+                    yield header, sequence
+                    header = line[1:].rstrip()
+                    sequence = ''
+                else:
+                    sequence += ''.join(line.rstrip().split()).upper()
+            yield header, sequence
+
+class CommandLine:
+    '''
+    Handle the command line, usage and help requests.
+
+    CommandLine uses argparse, now standard in 2.7 and beyond.
+    it implements a standard command line argument parser with various argument options,
+    a standard usage and help, and an error termination mechanism do-usage_and_die.
+
+    attributes:
+    all arguments received from the commandline using .add_argument will be
+    avalable within the .args attribute of object instantiated from CommandLine.
+    For example, if myCommandLine is an object of the class, and requiredbool was
+    set as an option using add_argument, then myCommandLine.args.requiredbool will
+    name that option.
+
+    '''
+
+    def __init__(self, inOpts=None):
+        '''
+        Constructor for CommandLine.
+
+        Args:
+            inOpts (list): Optional. List of command-line options and arguments.
+        '''
+        self.parser = argparse.ArgumentParser(
+            description='Motif analysis of FASTA sequences',
+            epilog='Motif analysis tool by YourName',
+            add_help=True,
+            prefix_chars='-',
+            usage='%(prog)s [options] -option1[default] <input >output'
+        )
+        self.parser.add_argument('-l', '--minMotif', nargs='?', type=int, default=3, action='store',
+                                 help='min kMer size')
+        self.parser.add_argument('-m', '--maxMotif', nargs='?', type=int, default=8, action='store',
+                                 help='max kMer size')
+        self.parser.add_argument('-c', '--cutoff', nargs='?', type=float, default=-4.0, action='store',
+                                 help='Zscore cutoff')
+        self.parser.add_argument('-v', '--version', action='version', version='%(prog)s 1.0')
+
+        if inOpts is None:
+            self.args = self.parser.parse_args()
+        else:
+            self.args = self.parser.parse_args(inOpts)
+
+class Genome:
+    '''
+    Analyze k-mers in genome sequences.
+    '''
+
+    def __init__(self, minK, maxK):
+        '''
+        Constructor for Genome.
+
+        Args:
+            minK (int): Minimum k-mer size.
+            maxK (int): Maximum k-mer size.
+        '''
+        self.minK = minK
+        self.maxK = maxK
+        self.motif_counts = defaultdict(int)
+
+    def count_motifs(self, sequence):
+        '''
+        Count k-mers in a sequence and store their counts.
+
+        Args:
+            sequence (str): The DNA sequence to analyze.
+        '''
+        for k in range(self.minK, self.maxK + 1):
+            for i in range(len(sequence) - k + 1):
+                motif = sequence[i:i + k]
+                canonical_motif = min(motif, reverse_complement(motif))
+                self.motif_counts[canonical_motif] += 1
+
+    def calculate_z_scores(self, total_seqs, cutoff):
+        '''
+        Calculate Z-scores for motifs.
+
+        Args:
+            total_seqs (int): Total number of sequences.
+            cutoff (float): Z-score cutoff.
+
+        Returns:
+            dict: A dictionary of motifs and their Z-scores.
+        '''
+        z_scores = {}
+        for motif, count in self.motif_counts.items():
+            mean = total_seqs / (4 ** len(motif))
+            std_dev = (mean * (1 - (1 / (4 ** len(motif)))) ** 0.5)
+            z_score = (count - mean) / std_dev
+            if z_score > cutoff:
+                z_scores[motif] = z_score
+        return z_scores
+
+    def Evalue(self, s):
+        '''
+        Calculate E-value for a motif.
+
+        Args:
+            s (str): The motif sequence.
+
+        Returns:
+            float: The E-value for the motif.
+        '''
+        return round(self.pValue(s) * self.n, 2)
+
+def reverse_complement(sequence):
+    '''
+    Calculate the reverse complement of a DNA sequence.
+
+    Args:
+        sequence (str): The DNA sequence.
+
+    Returns:
+        str: The reverse complement sequence.
+    '''
+    complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
+    return ''.join(complement[base] for base in sequence[::-1])
+
+def main(inFile=None, options=None):
+    '''
+    Main function for motif analysis.
+
+    Args:
+        inFile (str): Optional. Input FastA file.
+        options (list): Optional. List of command-line options and arguments.
+    '''
+    cl = CommandLine(options)
+    sourceReader = FastAreader(inFile)
+    thisGenome = Genome(cl.args.minMotif, cl.args.maxMotif)
+    
+    total_seqs = 0
+    for _, sequence in sourceReader.readFasta():
+        total_seqs += 1
+        thisGenome.count_motifs(sequence)
+
+    z_scores = thisGenome.calculate_z_scores(total_seqs, cl.args.cutoff)
+
+    sorted_z_scores = sorted(z_scores.items(), key=lambda x: (len(x[0]), x[1]))
+
+    with open("output.txt", 'w') as output_file:
+        output_file.write("sequence: reverse count Expect Zscore\n")
+        for motif, z_score in sorted_z_scores:
+            reverse_comp_motif = reverse_complement(motif)
+            count = thisGenome.motif_counts[motif]
+            expect = total_seqs / (4 ** len(motif))
+            output_file.write(f'{motif}:{reverse_comp_motif} {count} {expect:.2f} {z_score:.2f}\n')
+
+if __name__ == "__main__":
+    main(inFile="Ecoli-UMN026.fa", options=["--minMotif=1", "--maxMotif=8", "--cutoff=-4.0"])
